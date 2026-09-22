@@ -1,0 +1,27 @@
+[Unit]
+Description=Schlepp-Geschwindigkeit Display
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+# Nur die eigene Vorgaenger-Instanz beenden. Ein pauschales "pkill python3"
+# wuerde auch den Touch-Treiber ft5x06_touch.py erschlagen - und weil SIGTERM
+# fuer systemd ein sauberes Ende ist, kaeme der nicht von selbst wieder.
+# Klammern um den ersten Buchstaben: sonst passt das Muster auch auf diese
+# sh-Zeile selbst, und der Dienst erschiesst seinen eigenen Startvorgang.
+ExecStartPre=/bin/sh -c "pkill -f '[s]chlepp_display.py' 2>/dev/null; sleep 1; true"
+# USB-Stick einhaengen; beim Booten greift der fstab-Eintrag oft nicht, weil das
+# Geraet erst nach local-fs.target auftaucht. Fehlt der Stick, ist das kein Fehler.
+ExecStartPre=-/usr/bin/mount /media/schlepp
+# Auf den Touchscreen warten. SDL sucht seine Eingabegeraete beim Start; ein
+# Geraet, das erst danach auftaucht, wird nicht verlaesslich als Touchscreen
+# erkannt. Beim Booten entsteht /dev/input/event2 rund eine Sekunde zu spaet.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 40); do grep -q ft5x06 /proc/bus/input/devices && break; sleep 0.5; done; true'
+ExecStart=/usr/bin/python3 /opt/schlepp/schlepp_display.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

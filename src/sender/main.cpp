@@ -3,6 +3,7 @@
 #include <LoRa.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <Preferences.h>
 #include "esp_sleep.h"
 
 #define LORA_SCK    5
@@ -18,17 +19,51 @@
 #define MCPH21_ADDR  0x7F
 
 #define LORA_FREQ    868E6
+#define LORA_SYNC    0x3C      // eigenes Sync-Wort; 0x12 ist der Werkswert aller Boards
 #define WAKE_PIN     GPIO_NUM_0
 #define START_SPEED  20.0f     // km/h – ab hier läuft die Zeit
 #define SCHLEPP_MS   50000UL   // 50 Sekunden
+
+#define FLUG_SPEED   70.0f     // darueber sind wir in der Luft -> nicht senden
+#define FLUGZEUGTYP  "ASK21"   // <<< Flugzeugtyp – hier aendern
+#define TYP_SENDE_MS 1000UL    // Wiederholrate, solange unbestaetigt
+#define TYP_ACK_MS   250UL     // Horchfenster direkt nach dem Typ-Paket
+
+// Sendetakt. Gemessen wird immer mit 10 Hz - gefunkt wird im Wartezustand aber
+// nur einmal pro Sekunde. Ein Paket belegt rund 31 ms Sendezeit; mit 10 Hz
+// haelt ein einziger wartender Sender fast ein Drittel des Kanals besetzt und
+// erschlaegt damit die Pakete des Flugzeugs, das gerade wirklich startet.
+#define MESS_MS       100UL
+#define SEND_AKTIV_MS 100UL
+#define SEND_WARTE_MS 1000UL
+// Zufall gegen dauerhaften Gleichtakt zweier wartender Sender - in ganzen
+// Messtakten, sonst rutscht die Sendung ueber die naechste 100-ms-Grenze und
+// der Takt halbiert sich still. Im Schlepp funkt ohnehin nur ein Geraet, dort
+// bleibt es beim festen 10-Hz-Takt.
+#define SEND_JITTER_N 4UL      // 0 bis 3 Messtakte, also 0 bis 300 ms
+#define WARTE_MAX_MS  180000UL // 3 min ohne Bewegung -> schlafen, statt den Kanal zu belegen
+#define BEWEGUNG_KMH  10.0f    // darueber gilt das Flugzeug als in Bewegung
 
 enum State { WARTE, AKTIV };
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 static float mcph21_offset = 0;
+static Preferences prefs;             // haelt den Nullpunkt ueber Reset hinweg
 static State state = WARTE;
 static unsigned long schlepp_start = 0;
+static bool typ_bestaetigt = false;   // wird beim Neustart automatisch zurueckgesetzt
+static char senderId[5] = "????";     // eindeutig je Board, 4 Hexziffern
+
+// Kennung aus der Chip-Seriennummer. Es kann pro Flugzeug einen Sender geben,
+// der Empfaenger muss sie auseinanderhalten koennen. Alle 48 MAC-Bits werden
+// auf 16 gefaltet, damit sich nicht zufaellig zwei Boards nur in den oberen
+// Bits unterscheiden.
+static void kennungBilden() {
+    uint64_t mac = ESP.getEfuseMac();
+    uint16_t id = (uint16_t)mac ^ (uint16_t)(mac >> 16) ^ (uint16_t)(mac >> 32);
+    snprintf(senderId, sizeof(senderId), "%04X", id);
+}
 
 static bool mcph21_read(uint32_t &raw_pres) {
     Wire.beginTransmission(MCPH21_ADDR);
@@ -67,7 +102,12 @@ static void mcph21_calibrate() {
         if (mcph21_read(raw_p)) { sum += raw_p; count++; }
         delay(20);
     }
-    if (count > 0) mcph21_offset = (float)(sum / count);
+    if (count > 0) {
+        mcph21_offset = (float)(sum / count);
+        // Nullpunkt sichern: nach einem Reset in der Luft ist er die einzige
+        // Moeglichkeit, ueberhaupt eine gueltige Geschwindigkeit zu berechnen.
+        prefs.putFloat("offset", mcph21_offset);
+    }
     Serial.printf("MCPH21 Offset: %.1f\n", mcph21_offset);
 }
 
@@ -79,14 +119,54 @@ static float mcph21_speed_kmh() {
     return sqrtf(2.0f * pa / 1.225f) * 3.6f;
 }
 
-static void showDisplay(float speed) {
+// Sendet den Flugzeugtyp als eigenes Paket: "T:A3F1:ASK21"
+static void sendeTyp() {
+    LoRa.beginPacket();
+    LoRa.print("T:");
+    LoRa.print(senderId);
+    LoRa.print(":");
+    LoRa.print(FLUGZEUGTYP);
+    LoRa.endPacket();
+}
+
+// Horcht auf die Quittung des Empfaengers: "A:A3F1". Die Kennung muss darin
+// stehen - sonst nimmt ein zweites Flugzeug die Bestaetigung fuer ein anderes
+// als seine eigene und meldet seinen Typ nie wieder.
+static void pruefeTypAck() {
+    if (!LoRa.parsePacket()) return;
+
+    String msg;
+    while (LoRa.available()) msg += (char)LoRa.read();
+
+    if (msg.startsWith("A:") && msg.substring(2) == senderId) {
+        typ_bestaetigt = true;
+        Serial.printf("Typ %s vom Empfaenger bestaetigt\n", FLUGZEUGTYP);
+    }
+}
+
+// Nach dem Typ-Paket durchgehend horchen. Noetig, weil showDisplay() den
+// Loop sonst zig Millisekunden blockiert und die Quittung verpasst wuerde.
+static void warteAufAck(unsigned long dauer_ms) {
+    unsigned long start = millis();
+    while (!typ_bestaetigt && millis() - start < dauer_ms) {
+        pruefeTypAck();
+        yield();
+    }
+}
+
+static void showDisplay(float speed, unsigned long restMs) {
     char speedStr[8];
     snprintf(speedStr, sizeof(speedStr), "%.0f", speed);
 
     char statusStr[10];
-    if (state == WARTE)
-        snprintf(statusStr, sizeof(statusStr), "<20");
-    else {
+    if (state == WARTE) {
+        // Die letzte halbe Minute vor der Selbstabschaltung sichtbar machen -
+        // sonst geht das Geraet dem Piloten wortlos aus.
+        if (restMs <= 30000UL)
+            snprintf(statusStr, sizeof(statusStr), "AUS %lus", restMs / 1000);
+        else
+            snprintf(statusStr, sizeof(statusStr), "<20");
+    } else {
         int v = (int)((SCHLEPP_MS - (millis() - schlepp_start)) / 1000) + 1;
         snprintf(statusStr, sizeof(statusStr), "%ds", v);
     }
@@ -98,14 +178,67 @@ static void showDisplay(float speed) {
     // Status winzig unten rechts
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(128 - u8g2.getStrWidth(statusStr), 64, statusStr);
+    // Flugzeugtyp klein oben rechts – wie beim Empfaenger: ab 100 km/h weg und
+    // dann bis zum naechsten Neustart ausgeblendet.
+    static bool typAusgeblendet = false;
+    if (strlen(speedStr) > 2) typAusgeblendet = true;
+    if (!typAusgeblendet) {
+        u8g2.drawStr(128 - u8g2.getStrWidth(FLUGZEUGTYP), 7, FLUGZEUGTYP);
+    }
     u8g2.sendBuffer();
 }
 
-static void goToSleep() {
+// Pruefung direkt nach dem Start: sind wir schon in der Luft? Gerechnet wird
+// mit dem gespeicherten Nullpunkt vom Boden - eine frische Kalibrierung waere
+// hier wertlos, sie wuerde den Staudruck als Nullpunkt einlernen.
+static bool istInFlug() {
+    int treffer = 0;
+    for (int i = 0; i < 10; i++) {
+        if (mcph21_speed_kmh() > FLUG_SPEED) treffer++;
+        delay(20);
+    }
+    return treffer >= 6;      // Mehrheit, damit ein einzelner Ausreisser nicht genuegt
+}
+
+// Zurueck in den Schlaf, ohne LoRa auch nur zu initialisieren - so ist sicher,
+// dass dieses Geraet den Schlepp eines anderen Flugzeugs nicht stoert.
+//
+// Mit Ausweg: waere der gespeicherte Nullpunkt einmal falsch, haette sich das
+// Geraet sonst bei jedem Start fuer fliegend gehalten und waere dauerhaft
+// unbrauchbar. Ein Tastendruck im 3-Sekunden-Fenster erzwingt den Start. In
+// der Luft drueckt niemand, dort schlaeft es also wie vorgesehen ein.
+static bool startTrotzFlugerkennung() {
+    Serial.println("Reset in der Luft erkannt - kein Senden");
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_helvB14_tr);
-    u8g2.drawStr(0, 24, "Schlepp");
-    u8g2.drawStr(0, 42, "beendet.");
+    u8g2.drawStr(0, 20, "Im Flug:");
+    u8g2.drawStr(0, 38, "kein Senden");
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(0, 60, "Taste = trotzdem starten");
+    u8g2.sendBuffer();
+
+    pinMode(WAKE_PIN, INPUT_PULLUP);
+    unsigned long start = millis();
+    while (millis() - start < 3000) {
+        if (digitalRead(WAKE_PIN) == LOW) {
+            Serial.println("Taste gedrueckt - Start wird erzwungen");
+            return true;
+        }
+        delay(10);
+    }
+
+    Serial.println("zurueck in den Schlaf");
+    u8g2.setPowerSave(1);
+    esp_sleep_enable_ext0_wakeup(WAKE_PIN, 0);
+    esp_deep_sleep_start();
+    return false;                      // wird nie erreicht
+}
+
+static void goToSleep(const char* zeile1 = "Schlepp", const char* zeile2 = "beendet.") {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_helvB14_tr);
+    u8g2.drawStr(0, 24, zeile1);
+    u8g2.drawStr(0, 42, zeile2);
     u8g2.sendBuffer();
     LoRa.end();
     delay(2000);
@@ -117,12 +250,31 @@ static void goToSleep() {
 void setup() {
     Serial.begin(115200);
 
+    kennungBilden();
+    randomSeed(esp_random());
+
     Wire.begin(OLED_SDA, OLED_SCL);
     u8g2.begin();
+
+    // Zuerst pruefen, ob wir schon fliegen - noch bevor LoRa eingeschaltet wird.
+    prefs.begin("schlepp", false);
+    float alter_offset = prefs.getFloat("offset", 0.0f);
+    if (alter_offset > 0.0f) {
+        mcph21_offset = alter_offset;
+        // kehrt nur zurueck, wenn der Nutzer den Start ausdruecklich erzwingt
+        if (istInFlug()) startTrotzFlugerkennung();
+    }
+
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_helvB14_tr);
     u8g2.drawStr(0, 24, "Kalibriere");
     u8g2.drawStr(0, 42, "Pitot...");
+    // Kennung und Typ dieses Geraets - der einzige Ort, an dem sie ablesbar
+    // sind, ohne das Board an den Rechner zu haengen.
+    u8g2.setFont(u8g2_font_5x7_tr);
+    char kopf[24];
+    snprintf(kopf, sizeof(kopf), "%s  %s", senderId, FLUGZEUGTYP);
+    u8g2.drawStr(0, 60, kopf);
     u8g2.sendBuffer();
 
     mcph21_calibrate();
@@ -137,37 +289,77 @@ void setup() {
         Serial.println("LoRa Fehler");
         while (true) { delay(1000); }
     }
+    // Eigenes Sync-Wort: der Funkchip meldet fremde Pakete dann gar nicht erst.
+    // CRC: ohne sie reicht die Bibliothek verstuemmelte Pakete als Nutzdaten
+    // durch - aus Rauschen wuerde eine Geschwindigkeit.
+    LoRa.setSyncWord(LORA_SYNC);
+    LoRa.enableCrc();
 
-    Serial.println("Sender bereit");
+    Serial.printf("Sender bereit, Kennung %s, Typ %s\n", senderId, FLUGZEUGTYP);
 }
 
 void loop() {
-    static unsigned long letzterSend = 0;
+    static unsigned long letzteMessung = 0;
+    static unsigned long letzterFunk = 0;
+    static unsigned long letzterTypSend = 0;
+    static unsigned long jitter = 0;
+    static unsigned long letzteBewegung = 0;
     static float smoothedSpeed = 0.0f;
 
-    if (millis() - letzterSend >= 100) {  // 10x pro Sekunde
-        letzterSend = millis();
+    // Solange der Typ unbestaetigt ist: auf die Quittung horchen
+    if (!typ_bestaetigt) pruefeTypAck();
 
-        float raw = mcph21_speed_kmh();
-        smoothedSpeed = 0.04f * raw + 0.96f * smoothedSpeed;
-        float speed = smoothedSpeed;
-        Serial.printf("V:%.1f\n", speed);
+    if (millis() - letzteMessung < MESS_MS) return;
+    letzteMessung = millis();
 
-        if (state == WARTE && speed > START_SPEED) {
-            state = AKTIV;
-            schlepp_start = millis();
-        }
+    // Gemessen und geglaettet wird unabhaengig vom Sendetakt weiter mit 10 Hz,
+    // sonst wuerde der Start um bis zu eine Sekunde zu spaet erkannt.
+    float raw = mcph21_speed_kmh();
+    smoothedSpeed = 0.08f * raw + 0.92f * smoothedSpeed;
+    float speed = smoothedSpeed;
+    Serial.printf("V:%.1f\n", speed);
 
-        if (state == AKTIV && millis() - schlepp_start >= SCHLEPP_MS) {
-            goToSleep();
-        }
-
-        char paket[12];
-        snprintf(paket, sizeof(paket), "%.1f", speed);
-        LoRa.beginPacket();
-        LoRa.print(paket);
-        LoRa.endPacket();
-
-        showDisplay(speed);
+    if (state == WARTE && speed > START_SPEED) {
+        state = AKTIV;
+        schlepp_start = millis();
     }
+
+    if (state == AKTIV && millis() - schlepp_start >= SCHLEPP_MS) {
+        goToSleep();
+    }
+
+    // Vergessen eingeschaltet: nach WARTE_MAX_MS ohne Bewegung selbst schlafen
+    // legen, sonst funkt das Geraet den ganzen Flugtag dazwischen und leert
+    // nebenbei den Akku. Gezaehlt wird ab der letzten Bewegung, nicht ab dem
+    // Einschalten - Rangieren und Anschleppen ans Seil halten es wach.
+    if (speed > BEWEGUNG_KMH) letzteBewegung = millis();
+    unsigned long ruht = millis() - letzteBewegung;
+    if (state == WARTE && ruht >= WARTE_MAX_MS) {
+        goToSleep("Kein Start.", "Abschaltung.");
+    }
+
+    unsigned long abstand = (state == AKTIV) ? SEND_AKTIV_MS
+                                             : SEND_WARTE_MS + jitter;
+    if (millis() - letzterFunk >= abstand) {
+        letzterFunk = millis();
+        jitter = random(SEND_JITTER_N) * MESS_MS;
+
+        if (!typ_bestaetigt && millis() - letzterTypSend >= TYP_SENDE_MS) {
+            // Typ-Paket ersetzt in diesem Takt das Speed-Paket. Direkt hinter
+            // einem Speed-Paket wuerde es der Empfaenger verpassen, weil der
+            // dann noch in Display-Update und UDP-Versand haengt.
+            letzterTypSend = millis();
+            sendeTyp();
+            warteAufAck(TYP_ACK_MS);
+            letzterFunk = millis();
+        } else {
+            char paket[20];
+            snprintf(paket, sizeof(paket), "%s:%.1f", senderId, speed);
+            LoRa.beginPacket();
+            LoRa.print(paket);
+            LoRa.endPacket();
+        }
+    }
+
+    showDisplay(speed, WARTE_MAX_MS - ruht);
 }

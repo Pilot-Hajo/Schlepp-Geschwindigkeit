@@ -1,0 +1,17 @@
+[Unit]
+Description=FT5x06 Touch Userspace Driver
+After=multi-user.target
+Before=schlepp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/schlepp/ft5x06_touch.py
+# always statt on-failure: wird der Treiber von aussen abgeschossen, wertet
+# systemd das als sauberes Ende und wuerde ihn sonst liegen lassen.
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
