@@ -41,10 +41,20 @@
 // der Takt halbiert sich still. Im Schlepp funkt ohnehin nur ein Geraet, dort
 // bleibt es beim festen 10-Hz-Takt.
 #define SEND_JITTER_N 4UL      // 0 bis 3 Messtakte, also 0 bis 300 ms
-#define WARTE_MAX_MS  180000UL // 3 min ohne Bewegung -> schlafen, statt den Kanal zu belegen
+#define WARTE_MAX_MS  180000UL // 3 min ohne Bewegung -> in den Ruhetakt wechseln
 #define BEWEGUNG_KMH  10.0f    // darueber gilt das Flugzeug als in Bewegung
 
-enum State { WARTE, AKTIV };
+// Testbetrieb seit 04.10.2026: Der Sender schlaeft NICHT mehr ein. Am Flugplatz
+// kam keine Verbindung zustande, weil er nach drei Minuten abschaltete und der
+// Reset-Taster im eingebauten Zustand nicht erreichbar ist. Statt zu schlafen
+// funkt er weiter eine Geschwindigkeit je Minute und ist jederzeit bereit.
+// Der hoehere Stromverbrauch ist dabei bewusst in Kauf genommen.
+// Auf 1 setzen stellt das alte Verhalten wieder her (Stand: Tag
+// "stand-mit-schlafmodus").
+#define MIT_SCHLAFMODUS 0
+#define SEND_RUHE_MS  60000UL  // Ruhetakt: ein Paket je Minute
+
+enum State { WARTE, AKTIV, RUHE };
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
@@ -159,12 +169,17 @@ static void showDisplay(float speed, unsigned long restMs) {
     snprintf(speedStr, sizeof(speedStr), "%.0f", speed);
 
     char statusStr[10];
-    if (state == WARTE) {
+    if (state == RUHE) {
+        // Ruhetakt: ein Paket je Minute, das Geraet bleibt wach und bereit
+        snprintf(statusStr, sizeof(statusStr), "60s");
+    } else if (state == WARTE) {
+#if MIT_SCHLAFMODUS
         // Die letzte halbe Minute vor der Selbstabschaltung sichtbar machen -
         // sonst geht das Geraet dem Piloten wortlos aus.
         if (restMs <= 30000UL)
             snprintf(statusStr, sizeof(statusStr), "AUS %lus", restMs / 1000);
         else
+#endif
             snprintf(statusStr, sizeof(statusStr), "<20");
     } else {
         int v = (int)((SCHLEPP_MS - (millis() - schlepp_start)) / 1000) + 1;
@@ -234,6 +249,9 @@ static bool startTrotzFlugerkennung() {
     return false;                      // wird nie erreicht
 }
 
+#if MIT_SCHLAFMODUS
+// Nur im alten Betrieb. Die Flugerkennung beim Start schlaeft weiterhin
+// selbst, unabhaengig von diesem Schalter - sie hat ihren eigenen Weg.
 static void goToSleep(const char* zeile1 = "Schlepp", const char* zeile2 = "beendet.") {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_helvB14_tr);
@@ -246,6 +264,7 @@ static void goToSleep(const char* zeile1 = "Schlepp", const char* zeile2 = "been
     esp_sleep_enable_ext0_wakeup(WAKE_PIN, 0);
     esp_deep_sleep_start();
 }
+#endif
 
 void setup() {
     Serial.begin(115200);
@@ -304,6 +323,7 @@ void loop() {
     static unsigned long letzterTypSend = 0;
     static unsigned long jitter = 0;
     static unsigned long letzteBewegung = 0;
+    static bool startfreigabe = true;
     static float smoothedSpeed = 0.0f;
 
     // Solange der Typ unbestaetigt ist: auf die Quittung horchen
@@ -319,13 +339,32 @@ void loop() {
     float speed = smoothedSpeed;
     Serial.printf("V:%.1f\n", speed);
 
-    if (state == WARTE && speed > START_SPEED) {
+    // Ein neuer Schlepp erst, wenn das Flugzeug zwischendurch gestanden hat.
+    // Ohne diese Freigabe begaenne am Ende der 50 Sekunden sofort der naechste
+    // Schlepp - das Flugzeug haengt zu diesem Zeitpunkt ja noch mit voller
+    // Fahrt am Seil. Das Ergebnis waere Dauerfunk ueber den ganzen Flug und
+    // eine Kette von Schein-Schlepps auf der Karte.
+    if (speed < BEWEGUNG_KMH) startfreigabe = true;
+
+    // Auch aus dem Ruhetakt heraus: der naechste Start wird ohne Neustart erkannt
+    if (state != AKTIV && startfreigabe && speed > START_SPEED) {
         state = AKTIV;
         schlepp_start = millis();
+        startfreigabe = false;
+        Serial.println("Schlepp begonnen");
     }
 
     if (state == AKTIV && millis() - schlepp_start >= SCHLEPP_MS) {
+#if MIT_SCHLAFMODUS
         goToSleep();
+#else
+        // Kein Schlaf: in den Ruhetakt. Die 60 s Pause bis zum naechsten Paket
+        // sind laenger als die 3 s, nach denen der Empfaenger den Schlepp
+        // abschliesst - er wird also sauber gespeichert.
+        state = RUHE;
+        letzteBewegung = millis();
+        Serial.println("Schlepp beendet - weiter im Ruhetakt (60 s)");
+#endif
     }
 
     // Vergessen eingeschaltet: nach WARTE_MAX_MS ohne Bewegung selbst schlafen
@@ -335,16 +374,33 @@ void loop() {
     if (speed > BEWEGUNG_KMH) letzteBewegung = millis();
     unsigned long ruht = millis() - letzteBewegung;
     if (state == WARTE && ruht >= WARTE_MAX_MS) {
+#if MIT_SCHLAFMODUS
         goToSleep("Kein Start.", "Abschaltung.");
+#else
+        state = RUHE;
+        Serial.println("kein Start - weiter im Ruhetakt (60 s)");
+#endif
     }
 
-    unsigned long abstand = (state == AKTIV) ? SEND_AKTIV_MS
-                                             : SEND_WARTE_MS + jitter;
+    // Im Ruhetakt genuegt ein Paket je Minute. Solange der Typ aber noch nicht
+    // quittiert ist, bleibt es beim Sekundentakt: ein spaeter eingeschalteter
+    // Empfaenger soll die Verbindung in einer Sekunde haben und nicht in einer
+    // Minute - genau daran ist es am Flugplatz gescheitert.
+    unsigned long abstand;
+    if (state == AKTIV)                       abstand = SEND_AKTIV_MS;
+    else if (state == RUHE && typ_bestaetigt) abstand = SEND_RUHE_MS;
+    else                                      abstand = SEND_WARTE_MS + jitter;
     if (millis() - letzterFunk >= abstand) {
         letzterFunk = millis();
         jitter = random(SEND_JITTER_N) * MESS_MS;
 
-        if (!typ_bestaetigt && millis() - letzterTypSend >= TYP_SENDE_MS) {
+        // Lebenszeichen nur am Boden. Ueber START_SPEED wird entweder
+        // geschleppt - dann ist der Zustand AKTIV - oder geflogen. Ein Paket
+        // mit Flugfahrt wuerde den Empfaenger einrasten lassen und jede Minute
+        // einen Schein-Schlepp aufzeichnen.
+        if (state == RUHE && speed > START_SPEED) {
+            // schweigen
+        } else if (!typ_bestaetigt && millis() - letzterTypSend >= TYP_SENDE_MS) {
             // Typ-Paket ersetzt in diesem Takt das Speed-Paket. Direkt hinter
             // einem Speed-Paket wuerde es der Empfaenger verpassen, weil der
             // dann noch in Display-Update und UDP-Versand haengt.
